@@ -15,9 +15,10 @@
 # You should have received a copy of the GNU General Public License along
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 #
-# Guided setup of a VNC server on Fedora: installs TigerVNC (the maintained
-# fork of TightVNC, with the same Tight encoding) and an X11 desktop, then
-# runs a virtual desktop for one user as the systemd service vncserver@:N.
+# Guided setup of a VNC server on Fedora, Debian, Ubuntu or Linux Mint:
+# installs TigerVNC (the maintained fork of TightVNC, with the same Tight
+# encoding) and an X11 desktop, then runs a virtual desktop for one user as
+# the systemd service vncserver@:N (tigervncserver@:N on Debian and Ubuntu).
 #   vnc-setup            ask everything, with defaults in [brackets]
 #   vnc-setup -y         accept every default without asking
 # Afterwards, switch the desktop with vnc-desktop.
@@ -42,16 +43,18 @@ step() { step_no=$((step_no + 1)); printf '\n\033[1m== Step %d: %s ==\033[0m\n' 
 info() { echo "   $*"; }
 
 # ask VAR "question" default: read an answer into VAR, Enter takes the default.
+# Its local has a name no caller uses: a caller's VAR of the same name would
+# be shadowed, and the answer lost.
 ask() {
-    local answer
+    local _reply
     if [ "$assume_yes" = yes ]; then
-        answer=$3
-        echo "   $2 [$3] $answer"
+        _reply=$3
+        echo "   $2 [$3] $_reply"
     else
-        read -r -p "   $2 [$3] " answer
-        answer=${answer:-$3}
+        read -r -p "   $2 [$3] " _reply
+        _reply=${_reply:-$3}
     fi
-    printf -v "$1" '%s' "$answer"
+    printf -v "$1" '%s' "$_reply"
 }
 # confirm "question" y|n: true on yes.
 confirm() {
@@ -75,8 +78,31 @@ set_option() {
 }
 unset_option() { [ -f "$config" ] && as_user sed -i -E "/^$1(=|$)/d" "$config" || :; }
 
-grep -q '^ID=fedora' /etc/os-release || die "this script is for Fedora"
+# Fedora packages TigerVNC with upstream's names; Debian (and Ubuntu and Mint,
+# built on it) prefixes them with "tiger".
 . /etc/os-release
+case " $ID ${ID_LIKE:-} " in
+    *" fedora "*) family=fedora ;;
+    *" debian "*|*" ubuntu "*) family=debian ;;
+    *) die "this script is for Fedora, Debian, Ubuntu or Linux Mint" ;;
+esac
+if [ "$family" = fedora ]; then
+    vnc_packages=(tigervnc-x11-server tigervnc-selinux)
+    unit=vncserver
+    vncpasswd=vncpasswd
+    pkg_installed() { rpm -q "$1" >/dev/null 2>&1; }
+    pkg_install() { dnf install -y "$@"; }
+else
+    vnc_packages=(tigervnc-standalone-server tigervnc-tools)
+    unit=tigervncserver
+    vncpasswd=tigervncpasswd
+    pkg_installed() { [ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" = "install ok installed" ]; }
+    apt_updated=no
+    pkg_install() {
+        [ "$apt_updated" = yes ] || { apt-get update; apt_updated=yes; }
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+    }
+fi
 echo "VNC server setup for $PRETTY_NAME"
 echo "Press Enter to take the default in [brackets], Ctrl+C to stop at any time."
 
@@ -91,24 +117,42 @@ while :; do
     info "No such user (root is not allowed); try again."
 done
 home=$(getent passwd "$user" | cut -d: -f6)
-config="$home/.config/tigervnc/config"
 
 # ---------------------------------------------------------------------------
 step "Install the TigerVNC server"
-if rpm -q tigervnc-x11-server >/dev/null 2>&1; then
-    info "Already installed: $(rpm -q tigervnc-x11-server)"
+missing=()
+for p in "${vnc_packages[@]}"; do pkg_installed "$p" || missing+=("$p"); done
+if [ ${#missing[@]} -eq 0 ]; then
+    info "Already installed: ${vnc_packages[*]}"
 else
-    info "Installs tigervnc-x11-server (Xvnc, vncserver@.service, vncpasswd)."
+    info "Installs ${missing[*]} (Xvnc, $unit@.service, $vncpasswd)."
     confirm "Install it now?" y || die "the VNC server is needed; stopped"
-    dnf install -y tigervnc-x11-server tigervnc-selinux
+    pkg_install "${missing[@]}"
 fi
+# TigerVNC 1.14 moved its settings from ~/.vnc to ~/.config/tigervnc;
+# Debian 12 and Ubuntu 24.04 (Linux Mint 22) still have older versions.
+vnc_dir="$home/.config/tigervnc"
+if [ "$family" = debian ] && ! dpkg --compare-versions \
+        "$(dpkg-query -W -f='${Version}' tigervnc-standalone-server)" ge 1.14; then
+    vnc_dir="$home/.vnc"
+fi
+config="$vnc_dir/config"
 
 # ---------------------------------------------------------------------------
 step "Choose the default desktop for VNC"
 info "VNC needs an X11 desktop; Plasma and GNOME run their X11 variants here."
 # Keys match vnc-desktop (kde, gnome); the menu shows the names below.
-declare -A sessions=([xfce]=xfce [cinnamon]=cinnamon [kde]=plasmax11 [gnome]=gnome-flashback-metacity)
-declare -A packages=([xfce]=@xfce-desktop [cinnamon]=@cinnamon-desktop [kde]=plasma-workspace-x11 [gnome]=gnome-flashback)
+# Plasma 6 calls its X11 session plasmax11, Plasma 5 (Debian 12, Ubuntu
+# 24.04) plasma; each list names the X11 sessions to look for, in order.
+declare -A sessions=([xfce]=xfce [cinnamon]=cinnamon [kde]="plasmax11 plasma" [gnome]=gnome-flashback-metacity)
+if [ "$family" = fedora ]; then
+    declare -A packages=([xfce]=@xfce-desktop [cinnamon]=@cinnamon-desktop [kde]=plasma-workspace-x11 [gnome]=gnome-flashback)
+else
+    declare -A packages=([xfce]=xfce4 [cinnamon]=cinnamon-core [kde]=plasma-desktop [gnome]=gnome-session-flashback)
+    # Ubuntu 26.04 and later split Plasma's X11 session into its own package.
+    [ -n "$(apt-cache policy plasma-session-x11 2>/dev/null | grep 'Candidate: [0-9]')" ] &&
+        packages[kde]="plasma-desktop plasma-session-x11"
+fi
 declare -A names=([xfce]=xfce [kde]=plasma [cinnamon]=cinnamon [gnome]=gnome-fallback)
 declare -A labels=(
     [xfce]="Xfce: light and fast, the best fit for VNC"
@@ -117,7 +161,15 @@ declare -A labels=(
     [gnome]="GNOME Flashback (GNOME Shell cannot run under VNC)"
 )
 order=(xfce kde cinnamon gnome)
-installed() { [ -f "/usr/share/xsessions/${sessions[$1]}.desktop" ]; }
+# session_of DESKTOP: the first of its X11 sessions that is installed.
+session_of() {
+    local s
+    for s in ${sessions[$1]}; do
+        [ -f "/usr/share/xsessions/$s.desktop" ] && { echo "$s"; return; }
+    done
+    return 1
+}
+installed() { session_of "$1" >/dev/null; }
 for i in "${!order[@]}"; do
     d=${order[$i]}
     installed "$d" && mark="installed" || mark="to install"
@@ -141,9 +193,11 @@ info "Default desktop: ${names[$desktop]}"
 if ! installed "$desktop"; then
     info "Installs ${packages[$desktop]}; this can take a while."
     confirm "Install it now?" y || die "no desktop to run; stopped"
-    dnf install -y "${packages[$desktop]}"
-    installed "$desktop" || die "the ${sessions[$desktop]} X11 session is still missing after the install"
+    # shellcheck disable=SC2086 # a desktop can need several packages
+    pkg_install ${packages[$desktop]}
+    installed "$desktop" || die "the ${names[$desktop]} X11 session is still missing after the install"
 fi
+session=$(session_of "$desktop")
 case $desktop in
     kde|gnome)
         info "Note: a user can run only one ${names[$desktop]} session at a time. While VNC runs"
@@ -177,9 +231,9 @@ while :; do
     fi
 done
 port=$((5900 + display))
-service="vncserver@:$display"
+service="$unit@:$display"
 if [ -n "$existing" ] && [ "$existing" != "$display" ]; then
-    systemctl disable --now "vncserver@:$existing" 2>/dev/null || :
+    systemctl disable --now "$unit@:$existing" 2>/dev/null || :
     sed -i -E "/^:$existing=$user\$/d" "$users_file"
 fi
 grep -qE "^:$display=$user\$" "$users_file" || echo ":$display=$user" >> "$users_file"
@@ -189,13 +243,13 @@ info "Display :$display is assigned to $user in $users_file."
 step "Set the VNC password"
 info "This password is separate from $user's login password (only the first"
 info "8 characters count). A view-only password is optional; answer n to skip it."
-passwd_file=$(ls "$home/.config/tigervnc/passwd" "$home/.vnc/passwd" 2>/dev/null | head -1 || :)
+passwd_file=$(ls "$vnc_dir/passwd" 2>/dev/null || :)
 if [ -n "$passwd_file" ] && ! confirm "$user already has a VNC password. Change it?" n; then
     info "Keeping the existing password."
 else
     [ "$assume_yes" = yes ] && [ -z "$passwd_file" ] && die "a VNC password must be typed in; run without -y"
-    as_user mkdir -p "$home/.config/tigervnc"
-    until as_user vncpasswd; do info "Try again."; done
+    as_user mkdir -p "$vnc_dir"
+    until as_user "$vncpasswd" "$vnc_dir/passwd"; do info "Try again."; done
 fi
 
 # ---------------------------------------------------------------------------
@@ -214,48 +268,80 @@ while :; do
 done
 
 as_user mkdir -p "$(dirname "$config")"
-set_option session "${sessions[$desktop]}"
+set_option session "$session"
 set_option geometry "$geometry"
 set_option alwaysshared
 if [ "$access" = 1 ]; then set_option localhost; else unset_option localhost; fi
-restorecon -RF "$home/.config/tigervnc" 2>/dev/null || :
+restorecon -RF "$vnc_dir" 2>/dev/null || :
 info "Wrote $config:"
 sed 's/^/     /' "$config"
 
 # ---------------------------------------------------------------------------
 step "Firewall and SSH"
-fw_running=no
-systemctl is-active -q firewalld && fw_running=yes
+# Fedora uses firewalld; Ubuntu and Mint ship ufw (off unless enabled).
+firewall=none
+if systemctl is-active -q firewalld 2>/dev/null; then
+    firewall=firewalld
+    zone=$(firewall-cmd --get-default-zone)
+elif command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    firewall=ufw
+fi
+port_open() {
+    case $firewall in
+        firewalld) firewall-cmd -q --zone="$zone" --query-port="$port/tcp" ;;
+        ufw) ufw status | grep -qE "^$port/tcp +ALLOW" ;;
+        *) return 1 ;;
+    esac
+}
 if [ "$access" = 2 ]; then
-    if [ "$fw_running" = yes ]; then
-        zone=$(firewall-cmd --get-default-zone)
-        if firewall-cmd -q --zone="$zone" --query-port="$port/tcp"; then
-            info "Port $port/tcp is already open in zone $zone."
-        else
-            firewall-cmd -q --permanent --zone="$zone" --add-port="$port/tcp"
-            firewall-cmd -q --reload
-            info "Opened port $port/tcp in firewall zone $zone."
-        fi
+    if [ "$firewall" = none ]; then
+        info "No firewall (firewalld or ufw) is running; nothing to open."
+    elif port_open; then
+        info "Port $port/tcp is already open in $firewall."
     else
-        info "firewalld is not running; nothing to open."
+        case $firewall in
+            firewalld)
+                firewall-cmd -q --permanent --zone="$zone" --add-port="$port/tcp"
+                firewall-cmd -q --reload ;;
+            ufw) ufw allow "$port/tcp" >/dev/null ;;
+        esac
+        info "Opened port $port/tcp in $firewall."
     fi
 else
     # Close a port an earlier run with network access opened.
-    if [ "$fw_running" = yes ]; then
-        zone=$(firewall-cmd --get-default-zone)
-        if firewall-cmd -q --zone="$zone" --query-port="$port/tcp"; then
-            firewall-cmd -q --permanent --zone="$zone" --remove-port="$port/tcp"
-            firewall-cmd -q --reload
-            info "Closed port $port/tcp (not needed with an SSH tunnel)."
-        fi
+    if port_open; then
+        case $firewall in
+            firewalld)
+                firewall-cmd -q --permanent --zone="$zone" --remove-port="$port/tcp"
+                firewall-cmd -q --reload ;;
+            ufw) ufw delete allow "$port/tcp" >/dev/null ;;
+        esac
+        info "Closed port $port/tcp (not needed with an SSH tunnel)."
     fi
-    if systemctl is-active -q sshd; then
+    # The SSH server is sshd on Fedora, ssh on Debian; Ubuntu starts it on
+    # demand from ssh.socket.
+    ssh_running() {
+        local u
+        for u in sshd.service ssh.service ssh.socket; do
+            systemctl is-active -q "$u" 2>/dev/null && return
+        done
+        return 1
+    }
+    if ssh_running; then
         info "The SSH server is running."
     elif confirm "The SSH tunnel needs the SSH server, which is not running. Enable it?" y; then
-        rpm -q openssh-server >/dev/null 2>&1 || dnf install -y openssh-server
-        systemctl enable --now sshd
-        [ "$fw_running" = yes ] && firewall-cmd -q --permanent --add-service=ssh &&
-            firewall-cmd -q --reload
+        pkg_installed openssh-server || pkg_install openssh-server
+        if [ "$family" = fedora ]; then
+            systemctl enable --now sshd
+        elif systemctl is-enabled -q ssh.socket 2>/dev/null; then
+            systemctl start ssh.socket
+        else
+            systemctl enable --now ssh
+        fi
+        case $firewall in
+            firewalld) firewall-cmd -q --permanent --add-service=ssh && firewall-cmd -q --reload ;;
+            ufw) ufw allow OpenSSH >/dev/null ;;
+        esac
         info "The SSH server is running."
     else
         info "Without SSH, only this machine itself can connect to the VNC server."
@@ -267,7 +353,24 @@ step "Start the VNC server"
 systemctl daemon-reload
 if confirm "Start $service now and at every boot?" y; then
     systemctl enable -q "$service"
-    systemctl restart "$service"
+    systemctl stop "$service"
+    # The old desktop's programs live in the VNC login session, not in the
+    # service, and can outlive it; the new desktop quits if it finds them on
+    # the user's D-Bus. End those sessions, by force if they hang on.
+    vnc_sessions() {
+        local s
+        for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$user" '$3 == u { print $1 }'); do
+            [ "$(loginctl show-session "$s" -p Service --value 2>/dev/null)" = tigervnc ] && echo "$s"
+        done
+    }
+    for signal in TERM KILL; do
+        for s in $(vnc_sessions); do loginctl kill-session --signal="$signal" "$s" 2>/dev/null || :; done
+        for i in $(seq 12); do
+            [ -z "$(vnc_sessions)" ] && break 2
+            sleep 0.25
+        done
+    done
+    systemctl start "$service"
     sleep 2
     systemctl is-active -q "$service" ||
         die "the VNC server did not start; see: journalctl -u $service"

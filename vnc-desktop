@@ -31,27 +31,40 @@ if [ "$user" = root ]; then
     [ "$(echo "$users" | grep -c .)" -eq 1 ] && user=$users
 fi
 home=$(getent passwd "$user" | cut -d: -f6)
-config="$home/.config/tigervnc/config"
 
+# Each desktop's X11 sessions, in order: Plasma 6 calls its X11 session
+# plasmax11, Plasma 5 (Debian 12, Ubuntu 24.04) plasma.
 declare -A sessions=(
     [xfce]=xfce
     [cinnamon]=cinnamon
-    [kde]=plasmax11
+    [kde]="plasmax11 plasma"
     [gnome]=gnome-flashback-metacity
 )
 
 die() { echo "vnc-desktop: $*" >&2; exit 1; }
 
+# Debian, Ubuntu and Mint name the service tigervncserver@, Fedora vncserver@.
+# TigerVNC before 1.14 (Debian 12, Ubuntu 24.04, Mint 22) reads ~/.vnc.
+unit=vncserver
+config="$home/.config/tigervnc/config"
+if command -v dpkg-query >/dev/null &&
+   version=$(dpkg-query -W -f='${Version}' tigervnc-standalone-server 2>/dev/null); then
+    unit=tigervncserver
+    dpkg --compare-versions "$version" ge 1.14 || config="$home/.vnc/config"
+fi
+
 # The display assigned to this user in /etc/tigervnc/vncserver.users, e.g. :1.
 display=$(awk -F= -v u="$user" '$2 == u && $1 ~ /^:[0-9]+$/ { print $1; exit }' \
     /etc/tigervnc/vncserver.users 2>/dev/null)
 [ -n "$display" ] || die "no VNC display for $user in /etc/tigervnc/vncserver.users"
-service="vncserver@$display"
+service="$unit@$display"
 
 current=$(sed -n 's/^session=//p' "$config" 2>/dev/null | tail -1)
 name=${current:-none}
 for key in "${!sessions[@]}"; do
-    [ "${sessions[$key]}" = "$current" ] && name=$key
+    for s in ${sessions[$key]}; do
+        [ "$s" = "$current" ] && name=$key
+    done
 done
 
 case ${1:-} in
@@ -71,10 +84,12 @@ case ${1:-} in
 esac
 
 choice=${1,,}
-session=${sessions[$choice]:-}
-[ -n "$session" ] || die "usage: vnc-desktop xfce|cinnamon|kde|gnome [-y]"
-[ -f "/usr/share/xsessions/$session.desktop" ] ||
-    die "the X11 session $session is not installed"
+[ -n "${sessions[$choice]:-}" ] || die "usage: vnc-desktop xfce|cinnamon|kde|gnome [-y]"
+session=
+for s in ${sessions[$choice]}; do
+    [ -f "/usr/share/xsessions/$s.desktop" ] && { session=$s; break; }
+done
+[ -n "$session" ] || die "the $choice X11 session (${sessions[$choice]// / or }) is not installed"
 
 # GNOME and KDE run as systemd user sessions, and a user can only have one
 # of those at a time: VNC and the console (or another login) share it.
@@ -132,10 +147,14 @@ as_root() {
     if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
 }
 
+# The user's D-Bus: dbus-broker on Fedora, usually dbus-daemon on Debian.
+bus=dbus-broker.service
+as_user systemctl --user is-active -q "$bus" 2>/dev/null || bus=dbus.service
+
 # When the user's D-Bus last started, as a monotonic timestamp; GNOME
 # restarts it after each of its sessions ends.
 dbus_restarted() {
-    as_user systemctl --user show dbus-broker.service \
+    as_user systemctl --user show "$bus" \
         -p ActiveEnterTimestampMonotonic --value 2>/dev/null
 }
 
@@ -147,6 +166,27 @@ restarted=$(dbus_restarted)
 # Stop the VNC server first: services of the old desktop that restart while
 # it shuts down are then stopped too.
 as_root systemctl stop "$service"
+
+# The old desktop's programs live in the VNC login session, not in the
+# service, and can outlive it for a moment; the next desktop's session
+# manager then finds the old one on the user's D-Bus and quits. End those
+# login sessions (never the console's): politely, then, as a program stuck
+# on a D-Bus call can hang on for half a minute, by force.
+vnc_sessions() {
+    local s
+    for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$user" '$3 == u { print $1 }'); do
+        [ "$(loginctl show-session "$s" -p Service --value 2>/dev/null)" = tigervnc ] && echo "$s"
+    done
+}
+for signal in TERM KILL; do
+    for s in $(vnc_sessions); do
+        as_root loginctl kill-session --signal="$signal" "$s" 2>/dev/null || :
+    done
+    for i in $(seq 12); do
+        [ -z "$(vnc_sessions)" ] && break 2
+        sleep 0.25
+    done
+done
 
 # KDE and GNOME run parts of their desktop as systemd user services, which
 # would otherwise restart on the new VNC display and take over the next
@@ -164,7 +204,7 @@ if [ "$gnome_running" = yes ]; then
         sleep 0.25
     done
     for i in $(seq 40); do
-        as_user systemctl --user is-active -q dbus-broker.service && break
+        as_user systemctl --user is-active -q "$bus" && break
         sleep 0.25
     done
 fi

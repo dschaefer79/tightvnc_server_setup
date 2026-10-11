@@ -1,0 +1,311 @@
+#!/usr/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Dominique Schaefer <dschaefer79@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+# Guided setup of a VNC server on Fedora: installs TigerVNC (the maintained
+# fork of TightVNC, with the same Tight encoding) and an X11 desktop, then
+# runs a virtual desktop for one user as the systemd service vncserver@:N.
+#   vnc-setup            ask everything, with defaults in [brackets]
+#   vnc-setup -y         accept every default without asking
+# Afterwards, switch the desktop with vnc-desktop.
+set -euo pipefail
+
+# Root is needed to install packages and services; sudo keeps SUDO_USER.
+[ "$(id -u)" -eq 0 ] || exec sudo -- "$0" "$@"
+
+assume_yes=no
+case ${1:-} in
+    -y|--yes) assume_yes=yes ;;
+    "") ;;
+    *) echo "usage: vnc-setup [-y]" >&2; exit 2 ;;
+esac
+
+users_file=/etc/tigervnc/vncserver.users
+here=$(dirname "$(readlink -f "$0")")
+step_no=0
+
+die() { echo "vnc-setup: $*" >&2; exit 1; }
+step() { step_no=$((step_no + 1)); printf '\n\033[1m== Step %d: %s ==\033[0m\n' "$step_no" "$*"; }
+info() { echo "   $*"; }
+
+# ask VAR "question" default: read an answer into VAR, Enter takes the default.
+ask() {
+    local answer
+    if [ "$assume_yes" = yes ]; then
+        answer=$3
+        echo "   $2 [$3] $answer"
+    else
+        read -r -p "   $2 [$3] " answer
+        answer=${answer:-$3}
+    fi
+    printf -v "$1" '%s' "$answer"
+}
+# confirm "question" y|n: true on yes.
+confirm() {
+    local answer
+    ask answer "$1 (y/n)" "$2"
+    [[ $answer == [yY]* ]]
+}
+
+# Run a command as the VNC user, so the files it writes stay theirs.
+as_user() { runuser -u "$user" -- "$@"; }
+
+# set_option KEY [VALUE]: set "KEY=VALUE" (or a bare "KEY") in the user's
+# TigerVNC config, replacing an earlier setting.
+set_option() {
+    local line=$1${2+=$2}
+    if grep -qE "^$1(=|$)" "$config" 2>/dev/null; then
+        as_user sed -i -E "s|^$1(=.*)?$|$line|" "$config"
+    else
+        echo "$line" | as_user tee -a "$config" >/dev/null
+    fi
+}
+unset_option() { [ -f "$config" ] && as_user sed -i -E "/^$1(=|$)/d" "$config" || :; }
+
+grep -q '^ID=fedora' /etc/os-release || die "this script is for Fedora"
+. /etc/os-release
+echo "VNC server setup for $PRETTY_NAME"
+echo "Press Enter to take the default in [brackets], Ctrl+C to stop at any time."
+
+# ---------------------------------------------------------------------------
+step "Which user gets the VNC desktop"
+default_user=${SUDO_USER:-}
+[ "$default_user" = root ] && default_user=
+while :; do
+    ask user "User name:" "${default_user:-}"
+    [ -n "$user" ] && [ "$user" != root ] && getent passwd "$user" >/dev/null && break
+    [ "$assume_yes" = yes ] && die "no user given; run this with sudo from your own account"
+    info "No such user (root is not allowed); try again."
+done
+home=$(getent passwd "$user" | cut -d: -f6)
+config="$home/.config/tigervnc/config"
+
+# ---------------------------------------------------------------------------
+step "Install the TigerVNC server"
+if rpm -q tigervnc-x11-server >/dev/null 2>&1; then
+    info "Already installed: $(rpm -q tigervnc-x11-server)"
+else
+    info "Installs tigervnc-x11-server (Xvnc, vncserver@.service, vncpasswd)."
+    confirm "Install it now?" y || die "the VNC server is needed; stopped"
+    dnf install -y tigervnc-x11-server tigervnc-selinux
+fi
+
+# ---------------------------------------------------------------------------
+step "Choose the default desktop for VNC"
+info "VNC needs an X11 desktop; Plasma and GNOME run their X11 variants here."
+# Keys match vnc-desktop (kde, gnome); the menu shows the names below.
+declare -A sessions=([xfce]=xfce [cinnamon]=cinnamon [kde]=plasmax11 [gnome]=gnome-flashback-metacity)
+declare -A packages=([xfce]=@xfce-desktop [cinnamon]=@cinnamon-desktop [kde]=plasma-workspace-x11 [gnome]=gnome-flashback)
+declare -A names=([xfce]=xfce [kde]=plasma [cinnamon]=cinnamon [gnome]=gnome-fallback)
+declare -A labels=(
+    [xfce]="Xfce: light and fast, the best fit for VNC"
+    [kde]="KDE Plasma on X11"
+    [cinnamon]="Cinnamon: traditional, a bit heavier"
+    [gnome]="GNOME Flashback (GNOME Shell cannot run under VNC)"
+)
+order=(xfce kde cinnamon gnome)
+installed() { [ -f "/usr/share/xsessions/${sessions[$1]}.desktop" ]; }
+for i in "${!order[@]}"; do
+    d=${order[$i]}
+    installed "$d" && mark="installed" || mark="to install"
+    printf '   %d) %-15s %-52s [%s]\n' $((i + 1)) "${names[$d]}" "${labels[$d]}" "$mark"
+done
+while :; do
+    ask pick "Which desktop should VNC start by default? (1-4 or name)" 1
+    pick=${pick,,}
+    desktop=
+    case $pick in
+        [1-4]) desktop=${order[$((pick - 1))]} ;;
+        xfce) desktop=xfce ;;
+        plasma|kde) desktop=kde ;;
+        cinnamon) desktop=cinnamon ;;
+        gnome-fallback|gnome-flashback|gnome) desktop=gnome ;;
+    esac
+    [ -n "$desktop" ] && break
+    info "Pick 1-4, or one of: xfce, plasma, cinnamon, gnome-fallback."
+done
+info "Default desktop: ${names[$desktop]}"
+if ! installed "$desktop"; then
+    info "Installs ${packages[$desktop]}; this can take a while."
+    confirm "Install it now?" y || die "no desktop to run; stopped"
+    dnf install -y "${packages[$desktop]}"
+    installed "$desktop" || die "the ${sessions[$desktop]} X11 session is still missing after the install"
+fi
+case $desktop in
+    kde|gnome)
+        info "Note: a user can run only one ${names[$desktop]} session at a time. While VNC runs"
+        info "it, $user cannot log in to GNOME or KDE on the console (and vice versa)." ;;
+esac
+
+# ---------------------------------------------------------------------------
+step "Choose the VNC display number"
+info "Display :N listens on TCP port 5900+N (:1 is port 5901)."
+existing=$(awk -F= -v u="$user" '$2 == u && $1 ~ /^:[0-9]+$/ { print substr($1, 2); exit }' "$users_file" 2>/dev/null)
+if [ -n "$existing" ]; then
+    info "$user already has display :$existing in $users_file."
+    default_display=$existing
+else
+    default_display=1
+    while grep -qE "^:$default_display=" "$users_file" 2>/dev/null ||
+          [ -e "/tmp/.X11-unix/X$default_display" ]; do
+        default_display=$((default_display + 1))
+    done
+fi
+while :; do
+    ask display "Display number:" "$default_display"
+    [[ $display =~ ^[1-9][0-9]?$ ]] || { info "Use a number from 1 to 99."; continue; }
+    owner=$(awk -F= -v d=":$display" '$1 == d { print $2 }' "$users_file" 2>/dev/null)
+    if [ -n "$owner" ] && [ "$owner" != "$user" ]; then
+        info "Display :$display belongs to $owner; pick another."
+    elif [ -z "$owner" ] && [ -e "/tmp/.X11-unix/X$display" ]; then
+        info "An X server already runs on :$display; pick another."
+    else
+        break
+    fi
+done
+port=$((5900 + display))
+service="vncserver@:$display"
+if [ -n "$existing" ] && [ "$existing" != "$display" ]; then
+    systemctl disable --now "vncserver@:$existing" 2>/dev/null || :
+    sed -i -E "/^:$existing=$user\$/d" "$users_file"
+fi
+grep -qE "^:$display=$user\$" "$users_file" || echo ":$display=$user" >> "$users_file"
+info "Display :$display is assigned to $user in $users_file."
+
+# ---------------------------------------------------------------------------
+step "Set the VNC password"
+info "This password is separate from $user's login password (only the first"
+info "8 characters count). A view-only password is optional; answer n to skip it."
+passwd_file=$(ls "$home/.config/tigervnc/passwd" "$home/.vnc/passwd" 2>/dev/null | head -1 || :)
+if [ -n "$passwd_file" ] && ! confirm "$user already has a VNC password. Change it?" n; then
+    info "Keeping the existing password."
+else
+    [ "$assume_yes" = yes ] && [ -z "$passwd_file" ] && die "a VNC password must be typed in; run without -y"
+    as_user mkdir -p "$home/.config/tigervnc"
+    until as_user vncpasswd; do info "Try again."; done
+fi
+
+# ---------------------------------------------------------------------------
+step "Screen size and network access"
+ask geometry "Screen size (WIDTHxHEIGHT):" 1920x1080
+[[ $geometry =~ ^[0-9]+x[0-9]+$ ]] || die "the screen size must look like 1920x1080"
+echo
+info "1) Only through an SSH tunnel (recommended): the server listens on"
+info "   localhost only, and the connection is encrypted by SSH."
+info "2) Directly from the network: opens port $port in the firewall. TigerVNC"
+info "   encrypts with TLS, but only viewers that support it (TigerVNC, not"
+info "   every TightVNC or RealVNC viewer) will connect securely."
+while :; do
+    ask access "Access (1 or 2):" 1
+    [[ $access == [12] ]] && break
+done
+
+as_user mkdir -p "$(dirname "$config")"
+set_option session "${sessions[$desktop]}"
+set_option geometry "$geometry"
+set_option alwaysshared
+if [ "$access" = 1 ]; then set_option localhost; else unset_option localhost; fi
+restorecon -RF "$home/.config/tigervnc" 2>/dev/null || :
+info "Wrote $config:"
+sed 's/^/     /' "$config"
+
+# ---------------------------------------------------------------------------
+step "Firewall and SSH"
+fw_running=no
+systemctl is-active -q firewalld && fw_running=yes
+if [ "$access" = 2 ]; then
+    if [ "$fw_running" = yes ]; then
+        zone=$(firewall-cmd --get-default-zone)
+        if firewall-cmd -q --zone="$zone" --query-port="$port/tcp"; then
+            info "Port $port/tcp is already open in zone $zone."
+        else
+            firewall-cmd -q --permanent --zone="$zone" --add-port="$port/tcp"
+            firewall-cmd -q --reload
+            info "Opened port $port/tcp in firewall zone $zone."
+        fi
+    else
+        info "firewalld is not running; nothing to open."
+    fi
+else
+    # Close a port an earlier run with network access opened.
+    if [ "$fw_running" = yes ]; then
+        zone=$(firewall-cmd --get-default-zone)
+        if firewall-cmd -q --zone="$zone" --query-port="$port/tcp"; then
+            firewall-cmd -q --permanent --zone="$zone" --remove-port="$port/tcp"
+            firewall-cmd -q --reload
+            info "Closed port $port/tcp (not needed with an SSH tunnel)."
+        fi
+    fi
+    if systemctl is-active -q sshd; then
+        info "The SSH server is running."
+    elif confirm "The SSH tunnel needs the SSH server, which is not running. Enable it?" y; then
+        rpm -q openssh-server >/dev/null 2>&1 || dnf install -y openssh-server
+        systemctl enable --now sshd
+        [ "$fw_running" = yes ] && firewall-cmd -q --permanent --add-service=ssh &&
+            firewall-cmd -q --reload
+        info "The SSH server is running."
+    else
+        info "Without SSH, only this machine itself can connect to the VNC server."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+step "Start the VNC server"
+systemctl daemon-reload
+if confirm "Start $service now and at every boot?" y; then
+    systemctl enable -q "$service"
+    systemctl restart "$service"
+    sleep 2
+    systemctl is-active -q "$service" ||
+        die "the VNC server did not start; see: journalctl -u $service"
+    info "$service is running."
+else
+    info "Not started; start it later with: sudo systemctl enable --now $service"
+fi
+
+if [ -f "$here/vnc-desktop" ] && [ "$here" != /usr/local/bin ] &&
+   confirm "Install vnc-desktop (switch the VNC desktop later) to /usr/local/bin?" y; then
+    install -m 755 "$here/vnc-desktop" /usr/local/bin/vnc-desktop
+    info "Installed: run 'vnc-desktop' to change the desktop."
+fi
+
+# ---------------------------------------------------------------------------
+step "Done: how to connect"
+host=$(hostname)
+ip=$(hostname -I 2>/dev/null | awk '{ print $1 }')
+if [ "$access" = 1 ]; then
+    cat <<EOF
+   From another computer, open an SSH tunnel and leave it open:
+     ssh -L $port:localhost:$port $user@${ip:-$host}
+   then point a VNC viewer at:
+     localhost:$display        (vncviewer localhost:$display, or localhost:$port)
+   On Windows, PuTTY can make the same tunnel (Connection > SSH > Tunnels:
+   source port $port, destination localhost:$port).
+EOF
+else
+    cat <<EOF
+   Point a VNC viewer at:
+     ${ip:-$host}:$display     (vncviewer ${ip:-$host}:$display, or port $port)
+EOF
+fi
+cat <<EOF
+
+   Useful commands:
+     systemctl status $service       is it running?
+     journalctl -u $service          why it failed
+     sudo systemctl restart $service apply config changes
+     $config                         session, geometry and other options
+EOF

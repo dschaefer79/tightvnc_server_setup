@@ -1,0 +1,190 @@
+#!/usr/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Dominique Schaefer <dschaefer79@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+# Choose the desktop the TigerVNC server starts for you, then restart it.
+#   vnc-desktop                                pick the desktop from a menu
+#   vnc-desktop xfce|cinnamon|kde|gnome [-y]   switch and restart (-y: don't ask)
+#   vnc-desktop --status                       show the current desktop
+# GNOME Shell cannot run under VNC (it has no X11 session any more), so
+# "gnome" starts GNOME Flashback, GNOME's X11 desktop.
+set -euo pipefail
+
+# The VNC user: the one running this, the one behind sudo, or as root the
+# only user in /etc/tigervnc/vncserver.users (else: VNC_USER=name).
+user=${VNC_USER:-${SUDO_USER:-$(id -un)}}
+if [ "$user" = root ]; then
+    users=$(awk -F= '$1 ~ /^:[0-9]+$/ { print $2 }' /etc/tigervnc/vncserver.users 2>/dev/null)
+    [ "$(echo "$users" | grep -c .)" -eq 1 ] && user=$users
+fi
+home=$(getent passwd "$user" | cut -d: -f6)
+config="$home/.config/tigervnc/config"
+
+declare -A sessions=(
+    [xfce]=xfce
+    [cinnamon]=cinnamon
+    [kde]=plasmax11
+    [gnome]=gnome-flashback-metacity
+)
+
+die() { echo "vnc-desktop: $*" >&2; exit 1; }
+
+# The display assigned to this user in /etc/tigervnc/vncserver.users, e.g. :1.
+display=$(awk -F= -v u="$user" '$2 == u && $1 ~ /^:[0-9]+$/ { print $1; exit }' \
+    /etc/tigervnc/vncserver.users 2>/dev/null)
+[ -n "$display" ] || die "no VNC display for $user in /etc/tigervnc/vncserver.users"
+service="vncserver@$display"
+
+current=$(sed -n 's/^session=//p' "$config" 2>/dev/null | tail -1)
+name=${current:-none}
+for key in "${!sessions[@]}"; do
+    [ "${sessions[$key]}" = "$current" ] && name=$key
+done
+
+case ${1:-} in
+    --status)
+        echo "VNC display $display starts: $name ($(systemctl is-active "$service"))"
+        exit 0 ;;
+    "")
+        # No desktop given: pick one from a menu.
+        echo "VNC display $display starts: $name ($(systemctl is-active "$service"))"
+        echo "Choose the default desktop for VNC:"
+        PS3="Number (Enter shows the list again, Ctrl+C cancels): "
+        select pick in xfce cinnamon kde gnome; do
+            [ -n "$pick" ] && break
+        done
+        [ -n "${pick:-}" ] || exit 1
+        set -- "$pick" ;;
+esac
+
+choice=${1,,}
+session=${sessions[$choice]:-}
+[ -n "$session" ] || die "usage: vnc-desktop xfce|cinnamon|kde|gnome [-y]"
+[ -f "/usr/share/xsessions/$session.desktop" ] ||
+    die "the X11 session $session is not installed"
+
+# GNOME and KDE run as systemd user sessions, and a user can only have one
+# of those at a time: VNC and the console (or another login) share it.
+other_desktop() {
+    local s
+    for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$user" '$3 == u { print $1 }'); do
+        [ "$(loginctl show-session "$s" -p Service --value)" = tigervnc ] && continue
+        [ "$(loginctl show-session "$s" -p Remote --value)" = yes ] && continue
+        [ "$(loginctl show-session "$s" -p State --value)" = closing ] && continue
+        case $(loginctl show-session "$s" -p Desktop --value) in
+            *GNOME*|*gnome*) echo GNOME; return ;;
+            *KDE*|*plasma*) echo KDE; return ;;
+        esac
+    done
+}
+case $choice in
+    gnome|kde)
+        running=$(other_desktop)
+        [ -z "$running" ] || die "you are logged in with $running elsewhere (such as the console); a user can only run one GNOME or KDE session at a time, so log out there first or pick xfce or cinnamon"
+        echo "Note: while VNC runs $choice, logging in to GNOME or KDE on the console fails; use Xfce or Cinnamon there." ;;
+esac
+
+# As root, edit the file as the user so it stays theirs.
+edit_as_user() {
+    if [ "$(id -u)" -eq 0 ] && [ "$user" != root ]; then
+        runuser -u "$user" -- "$@"
+    else
+        "$@"
+    fi
+}
+edit_as_user mkdir -p "$(dirname "$config")"
+if grep -q '^session=' "$config" 2>/dev/null; then
+    edit_as_user sed -i "s/^session=.*/session=$session/" "$config"
+else
+    echo "session=$session" | edit_as_user tee -a "$config" >/dev/null
+fi
+echo "VNC display $display will start $choice ($session)."
+
+if [ "${2:-}" != -y ] && systemctl is-active -q "$service"; then
+    read -r -p "Restart the VNC server now? This closes the open VNC session. [y/N] " answer
+    [[ $answer == [yY]* ]] || { echo "Not restarted; it starts $choice next time."; exit 0; }
+fi
+
+# Run a command in the user's systemd and D-Bus context, also as root.
+uid=$(id -u "$user")
+as_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+    else
+        "$@"
+    fi
+}
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+# When the user's D-Bus last started, as a monotonic timestamp; GNOME
+# restarts it after each of its sessions ends.
+dbus_restarted() {
+    as_user systemctl --user show dbus-broker.service \
+        -p ActiveEnterTimestampMonotonic --value 2>/dev/null
+}
+
+gnome_running=no
+as_user systemctl --user is-active -q 'gnome-session-manager@*.service' 2>/dev/null &&
+    gnome_running=yes
+restarted=$(dbus_restarted)
+
+# Stop the VNC server first: services of the old desktop that restart while
+# it shuts down are then stopped too.
+as_root systemctl stop "$service"
+
+# KDE and GNOME run parts of their desktop as systemd user services, which
+# would otherwise restart on the new VNC display and take over the next
+# desktop (KWin replacing its window manager, KDE's theme on its apps).
+as_user systemctl --user stop 'plasma-*.service' 'gnome-session*.target' \
+    'gnome-session-manager@*.service' 'org.gnome.*.service' 2>/dev/null || :
+pkill -u "$user" -x xsettingsd 2>/dev/null || :
+
+# When a GNOME session ends, GNOME restarts the user's D-Bus a moment later,
+# which would end the next desktop as it starts: wait until that happened
+# and the bus is back.
+if [ "$gnome_running" = yes ]; then
+    for i in $(seq 40); do
+        [ "$(dbus_restarted)" != "$restarted" ] && break
+        sleep 0.25
+    done
+    for i in $(seq 40); do
+        as_user systemctl --user is-active -q dbus-broker.service && break
+        sleep 0.25
+    done
+fi
+
+# GNOME refuses to start while graphical-session.target is active, and KDE
+# leaves it active. Stop it unless another login of this user (such as the
+# local one) runs a desktop that uses it.
+others=no
+for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$user" '$3 == u { print $1 }'); do
+    [ "$(loginctl show-session "$s" -p Service --value)" = tigervnc ] && continue
+    case $(loginctl show-session "$s" -p Desktop --value) in
+        *GNOME*|*KDE*|*gnome*|*plasma*) others=yes ;;
+    esac
+done
+if [ "$others" = no ]; then
+    as_user systemctl --user stop graphical-session.target 2>/dev/null || :
+    as_user systemctl --user reset-failed 2>/dev/null || :
+fi
+
+as_root systemctl start "$service"
+sleep 2
+systemctl is-active -q "$service" && echo "VNC server restarted with $choice." ||
+    die "the VNC server did not start; see: journalctl -u $service"
